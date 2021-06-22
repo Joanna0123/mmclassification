@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
 from mmcv.cnn import (ConvModule, build_conv_layer, build_norm_layer,
@@ -7,6 +8,54 @@ from mmcv.utils.parrots_wrapper import _BatchNorm
 from ..builder import BACKBONES
 from .base_backbone import BaseBackbone
 
+class MHSA(nn.Module):
+    def __init__(self, n_dims,block_stage, stride,width=32, height=32, heads=4):
+        super(MHSA, self).__init__()
+        self.heads = heads
+        self.dims=n_dims
+        self.block_stage = block_stage
+        width = int(224/(2**(self.block_stage+2)))
+        height = int(224/(2**(self.block_stage+2)))
+        #width = 7
+        #height = 7
+        C = n_dims
+        if stride>1:
+            width=2*width
+            height=2*height
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.rel_h = nn.Parameter(torch.randn([1, self.heads, C // self.heads, 1, height]).to(device), requires_grad=True)
+        self.rel_w = nn.Parameter(torch.randn([1, self.heads, C // self.heads, width, 1]).to(device), requires_grad=True)
+        
+        #self.abs = nn.Parameter(torch.randn([1, self.heads, C // self.heads, width, height]).to(device), requires_grad=True)
+        
+        self.query = nn.Conv2d(n_dims, n_dims, kernel_size=1)
+        self.key = nn.Conv2d(n_dims, n_dims, kernel_size=1)
+        self.value = nn.Conv2d(n_dims, n_dims, kernel_size=1)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        n_batch, C, width, height = x.size()   
+        
+        q = self.query(x).view(n_batch, self.heads, C // self.heads, -1)
+        k = self.key(x).view(n_batch, self.heads, C // self.heads, -1)
+        v = self.value(x).view(n_batch, self.heads, C // self.heads, -1)
+
+        content_content = torch.matmul(q.permute(0, 1, 3, 2), k)
+        content_position = (self.rel_h + self.rel_w).view(1, self.heads, C // self.heads, -1).permute(0, 1, 3, 2)
+        #content_position = (self.abs).view(1, self.heads, C // self.heads, -1).permute(0, 1, 3, 2)
+        
+        content_position = torch.matmul(content_position, q)
+        energy = content_content + content_position
+        #energy = content_content
+        attention = self.softmax(energy)
+
+        out = torch.matmul(v, attention.permute(0, 1, 3, 2))
+        out = out.view(n_batch, C, width, height)
+
+        return out
 
 class BasicBlock(nn.Module):
     """BasicBlock for ResNet.
@@ -34,6 +83,7 @@ class BasicBlock(nn.Module):
     def __init__(self,
                  in_channels,
                  out_channels,
+                 block_stage,
                  expansion=1,
                  stride=1,
                  dilation=1,
@@ -41,10 +91,12 @@ class BasicBlock(nn.Module):
                  style='pytorch',
                  with_cp=False,
                  conv_cfg=None,
-                 norm_cfg=dict(type='BN')):
+                 norm_cfg=dict(type='BN'),
+                 mhsa=False):
         super(BasicBlock, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.block_stage = block_stage
         self.expansion = expansion
         assert self.expansion == 1
         assert out_channels % expansion == 0
@@ -55,6 +107,7 @@ class BasicBlock(nn.Module):
         self.with_cp = with_cp
         self.conv_cfg = conv_cfg
         self.norm_cfg = norm_cfg
+        self.mhsa = mhsa
 
         self.norm1_name, norm1 = build_norm_layer(
             norm_cfg, self.mid_channels, postfix=1)
@@ -141,11 +194,14 @@ class Bottleneck(nn.Module):
             layer. Default: None
         norm_cfg (dict): dictionary to construct and config norm layer.
             Default: dict(type='BN')
+        mhsa (bool): Replace the bottleneck with bottlenet transformer or not.
     """
 
     def __init__(self,
                  in_channels,
                  out_channels,
+                 block_stage,
+                 residual=True,
                  expansion=4,
                  stride=1,
                  dilation=1,
@@ -153,12 +209,15 @@ class Bottleneck(nn.Module):
                  style='pytorch',
                  with_cp=False,
                  conv_cfg=None,
-                 norm_cfg=dict(type='BN')):
+                 norm_cfg=dict(type='BN'),
+                 mhsa=False):
         super(Bottleneck, self).__init__()
         assert style in ['pytorch', 'caffe']
 
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.block_stage = block_stage
+        self.residual = residual
         self.expansion = expansion
         assert out_channels % expansion == 0
         self.mid_channels = out_channels // expansion
@@ -168,7 +227,10 @@ class Bottleneck(nn.Module):
         self.with_cp = with_cp
         self.conv_cfg = conv_cfg
         self.norm_cfg = norm_cfg
-
+        self.mhsa = mhsa
+        
+        self.num_para_mhsa = 0
+        
         if self.style == 'pytorch':
             self.conv1_stride = 1
             self.conv2_stride = stride
@@ -191,15 +253,28 @@ class Bottleneck(nn.Module):
             stride=self.conv1_stride,
             bias=False)
         self.add_module(self.norm1_name, norm1)
-        self.conv2 = build_conv_layer(
-            conv_cfg,
-            self.mid_channels,
-            self.mid_channels,
-            kernel_size=3,
-            stride=self.conv2_stride,
-            padding=dilation,
-            dilation=dilation,
-            bias=False)
+        if not self.mhsa:
+            self.conv2 = build_conv_layer(
+                conv_cfg,
+                self.mid_channels,
+                self.mid_channels,
+                kernel_size=3,
+                stride=self.conv2_stride,
+                padding=dilation,
+                dilation=dilation,
+                bias=False)
+        else:
+            self.conv2 = nn.ModuleList()
+            self.conv2.append(MHSA(n_dims=self.mid_channels,block_stage=self.block_stage, stride=self.stride, heads=4))
+            
+            mhsa_model = MHSA(n_dims=self.mid_channels,block_stage=self.block_stage,stride=self.stride, heads=4)
+            trainable_num = sum(p.numel() for p in mhsa_model.parameters() if p.requires_grad)
+            self.num_para_mhsa = self.num_para_mhsa + trainable_num
+            print("number of parameters of mhsa: ",trainable_num,self.num_para_mhsa)
+            
+            if stride == 2:
+                self.conv2.append(nn.AvgPool2d(2, 2))
+            self.conv2 = nn.Sequential(*self.conv2)
 
         self.add_module(self.norm2_name, norm2)
         self.conv3 = build_conv_layer(
@@ -243,8 +318,12 @@ class Bottleneck(nn.Module):
 
             if self.downsample is not None:
                 identity = self.downsample(x)
-
-            out += identity
+            
+            if self.residual:
+                out += identity
+            
+            
+        
 
             return out
 
@@ -318,8 +397,11 @@ class ResLayer(nn.Sequential):
     def __init__(self,
                  block,
                  num_blocks,
+                 block_stage,
                  in_channels,
                  out_channels,
+                 residual=True,
+                 mhsa=False,
                  expansion=None,
                  stride=1,
                  avg_down=False,
@@ -328,9 +410,11 @@ class ResLayer(nn.Sequential):
                  **kwargs):
         self.block = block
         self.expansion = get_expansion(block, expansion)
+        self.residual = residual
+        self.block_stage = block_stage
 
         downsample = None
-        if stride != 1 or in_channels != out_channels:
+        if (stride != 1 or in_channels != out_channels) and self.residual:
             downsample = []
             conv_stride = stride
             if avg_down and stride != 1:
@@ -358,11 +442,14 @@ class ResLayer(nn.Sequential):
             block(
                 in_channels=in_channels,
                 out_channels=out_channels,
+                block_stage = self.block_stage,
+                residual=self.residual,
                 expansion=self.expansion,
                 stride=stride,
                 downsample=downsample,
                 conv_cfg=conv_cfg,
                 norm_cfg=norm_cfg,
+                mhsa=mhsa,
                 **kwargs))
         in_channels = out_channels
         for i in range(1, num_blocks):
@@ -370,10 +457,12 @@ class ResLayer(nn.Sequential):
                 block(
                     in_channels=in_channels,
                     out_channels=out_channels,
+                    block_stage = self.block_stage,
                     expansion=self.expansion,
                     stride=1,
                     conv_cfg=conv_cfg,
                     norm_cfg=norm_cfg,
+                    mhsa=mhsa,
                     **kwargs))
         super(ResLayer, self).__init__(*layers)
 
@@ -436,6 +525,8 @@ class ResNet(BaseBackbone):
     arch_settings = {
         18: (BasicBlock, (2, 2, 2, 2)),
         34: (BasicBlock, (3, 4, 6, 3)),
+        #50: (Bottleneck, (5, 3, 6, 2)), #same para as mhsa
+        #50: (Bottleneck, (3, 4, 6, 2)), #same flops as mhsa
         50: (Bottleneck, (3, 4, 6, 3)),
         101: (Bottleneck, (3, 4, 23, 3)),
         152: (Bottleneck, (3, 8, 36, 3))
@@ -447,6 +538,7 @@ class ResNet(BaseBackbone):
                  stem_channels=64,
                  base_channels=64,
                  expansion=None,
+                 residual=(True,True,True,True),
                  num_stages=4,
                  strides=(1, 2, 2, 2),
                  dilations=(1, 1, 1, 1),
@@ -459,7 +551,8 @@ class ResNet(BaseBackbone):
                  norm_cfg=dict(type='BN', requires_grad=True),
                  norm_eval=False,
                  with_cp=False,
-                 zero_init_residual=True):
+                 zero_init_residual=True,
+                 mhsa=(False,False,False,False)):
         super(ResNet, self).__init__()
         if depth not in self.arch_settings:
             raise KeyError(f'invalid depth {depth} for resnet')
@@ -467,6 +560,7 @@ class ResNet(BaseBackbone):
         self.stem_channels = stem_channels
         self.base_channels = base_channels
         self.num_stages = num_stages
+        self.residual=residual
         assert num_stages >= 1 and num_stages <= 4
         self.strides = strides
         self.dilations = dilations
@@ -482,6 +576,7 @@ class ResNet(BaseBackbone):
         self.with_cp = with_cp
         self.norm_eval = norm_eval
         self.zero_init_residual = zero_init_residual
+        self.mhsa = mhsa
         self.block, stage_blocks = self.arch_settings[depth]
         self.stage_blocks = stage_blocks[:num_stages]
         self.expansion = get_expansion(self.block, expansion)
@@ -494,11 +589,15 @@ class ResNet(BaseBackbone):
         for i, num_blocks in enumerate(self.stage_blocks):
             stride = strides[i]
             dilation = dilations[i]
+            residual = self.residual[i]
+            mhsa = self.mhsa[i]
             res_layer = self.make_res_layer(
                 block=self.block,
+                block_stage = i,
                 num_blocks=num_blocks,
                 in_channels=_in_channels,
                 out_channels=_out_channels,
+                residual=residual,
                 expansion=self.expansion,
                 stride=stride,
                 dilation=dilation,
@@ -506,7 +605,9 @@ class ResNet(BaseBackbone):
                 avg_down=self.avg_down,
                 with_cp=with_cp,
                 conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg)
+                norm_cfg=norm_cfg,
+                mhsa=mhsa
+                )
             _in_channels = _out_channels
             _out_channels *= 2
             layer_name = f'layer{i + 1}'
